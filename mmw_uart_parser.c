@@ -2,167 +2,235 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <windows.h> // Windows API for Serial Communication
 
-// 구조체 바이트 정렬을 1바이트로 강제 설정 (이전 문제 해결)
-#pragma pack(1) 
+// --- 1. 설정 및 상수 ---
+#define MAGIC_WORD 0xDEADBEEF // TI mmWave 레이더 패킷 시작 매직 워드
+#define HEADER_SIZE 40        // MmwDemo_Header의 크기 (TI SDK v3.x 기준 40 bytes)
+#define MAX_BUFFER_SIZE 4096  // UART 수신 버퍼 최대 크기
 
-// 1. TI mmWave 패킷 헤더 구조
+// ----------------------------------------------------------------------
+// 2. 구조체 정의 (바이트 정렬 필수)
+// ----------------------------------------------------------------------
+#pragma pack(1)
+
+// MmwDemo_Header (40 bytes)
 typedef struct {
-    uint32_t magicWord;   // 4 bytes
-    uint32_t version;     // 4 bytes
-    uint32_t totalLength; // 4 bytes
-    uint32_t frameNumber; // 4 bytes
-    uint32_t platform;    // 4 bytes
-    uint32_t timeCpuCycles; // 4 bytes
-    uint16_t numDetectedObj; // 2 bytes
-    uint16_t numTLV;       // 2 bytes
-    uint32_t subFrameNum;  // 4 bytes
-    // 총 40 bytes
+    uint32_t magicWord;
+    uint32_t version;
+    uint32_t totalLength;   // 전체 패킷 길이
+    uint32_t frameNumber;
+    uint32_t platform;
+    uint32_t timeCpuCycles;
+    uint16_t numDetectedObj; // 검출된 객체 수
+    uint16_t numTLV;         // 뒤따르는 TLV 블록 수
+    uint32_t subFrameNum;
 } MmwDemo_Header;
 
-// 2. Type 1: Point Cloud의 개별 점(Point) 데이터 구조 (8 bytes)
+// Type 1: Point Cloud의 개별 점(Point) 데이터 구조 (8 bytes)
 typedef struct {
-    int16_t x;          // X 좌표 (2 bytes)
-    int16_t y;          // Y 좌표 (2 bytes)
-    int16_t z;          // Z 좌표 (2 bytes)
-    int16_t velocity;   // 도플러 속도 (2 bytes)
+    int16_t x;
+    int16_t y;
+    int16_t z;
+    int16_t velocity;
 } PointCloud_t;
 
-// 3. TLV 블록 헤더 (8 bytes)
+// Type 7: SNR/Noise 정보의 개별 항목 (Point당 4 bytes 가정)
 typedef struct {
-    uint32_t type;     // 4 bytes
-    uint32_t length;   // 4 bytes
+    int16_t snr;    // SNR 값
+    int16_t noise;  // Noise 값
+} SNRInfo_t;
+
+// TLV 블록 헤더 (8 bytes)
+typedef struct {
+    uint32_t type;
+    uint32_t length;
 } TLV_Header;
 
-// 구조체 정렬 설정을 기본값으로 되돌림 (선택 사항이지만 안전함)
 #pragma pack() 
+// ----------------------------------------------------------------------
 
 
-// 4. 엔디안 변환 함수: Big-Endian -> Little-Endian (또는 그 반대)
-// 현재 시스템(PC)과 데이터 송신측(FPGA/레이더)의 바이트 순서가 다를 때 사용됩니다.
+// ----------------------------------------------------------------------
+// 3. 엔디안 변환 함수 (현재 Little Endian 가정으로 주석 처리됨)
+// ----------------------------------------------------------------------
+/*
 uint32_t swap_endian32(uint32_t val) {
     return (val << 24) | ((val << 8) & 0x00FF0000) |
-        ((val >> 8) & 0x0000FF00) | (val >> 24);
+           ((val >> 8) & 0x0000FF00) | (val >> 24);
 }
+
 uint16_t swap_endian16(uint16_t val) {
     return (val << 8) | (val >> 8);
 }
+*/
 
 
-// --- 가상 데이터 정의 ---
-// 현재 코드는 Little Endian으로 데이터가 배열되어 있습니다 (0xEF, 0xBE, 0xAD, 0xDE)
-// 만약 레이더가 Big Endian으로 보낸다면, 이 데이터 배열을 Big Endian 순서로 바꿔야 합니다.
-// 하지만 일단 지금은 파싱 로직만 수정하고, 이 데이터 배열은 그대로 두겠습니다.
-uint8_t rx_buffer[100] = {
-    // ... (이전과 동일한 가상 데이터) ...
-    // ----------------------------------------------------------------------
-    // 1. MmwDemo_Header (40 Bytes) - 예시 MagicWord: 0xDEADBEEF
-    // ----------------------------------------------------------------------
-    0xEF, 0xBE, 0xAD, 0xDE, // Magic Word (0xDEADBEEF, Little Endian)
-    0x00, 0x00, 0x00, 0x00, // Version (임의)
-    0x58, 0x00, 0x00, 0x00, // Total Length (88 bytes, Little Endian)
-    0x00, 0x00, 0x00, 0x00, // Frame Number
-    0x00, 0x00, 0x00, 0x00, // Platform
-    0x00, 0x00, 0x00, 0x00, // Time CPU Cycles
-    0x00, 0x00, 0x00, 0x00, // 4 bytes padding (version ~ timeCpuCycles)
-    0x01, 0x00,             // numDetectedObj = 1 (1 point)
-    0x02, 0x00,             // numTLV = 2 (Type 1, Type 7)
-    0x00, 0x00, 0x00, 0x00, // subFrameNum (4 bytes)
-    // ----------------------------------------------------------------------
-    // 2. TLV 1: Point Cloud (Type 1, Length 8 Bytes)
-    // ----------------------------------------------------------------------
-    0x01, 0x00, 0x00, 0x00, // TLV Type = 1 (Little Endian)
-    0x08, 0x00, 0x00, 0x00, // TLV Length = 8 (1 Point * 8 bytes/Point)
-    // V: PointCloud_t (1st Point - 8 Bytes)
-    0x32, 0x00,             // X = 50 (Little Endian)
-    0x00, 0x01,             // Y = 256 (Little Endian)
-    0x0A, 0x00,             // Z = 10 (Little Endian)
-    0xF6, 0xFF,             // Velocity = -10 (Little Endian)
-    // ----------------------------------------------------------------------
-    // 3. TLV 2: SNR Info (Type 7, Length 8 Bytes)
-    // ----------------------------------------------------------------------
-    0x07, 0x00, 0x00, 0x00, // TLV Type = 7
-    0x08, 0x00, 0x00, 0x00, // TLV Length = 8 (1 SNR value * 8 bytes/value)
-    // V: SNR Data (8 Bytes)
-    0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00
-};
+// ----------------------------------------------------------------------
+// 4. TLV 파싱 함수 (Type 1과 Type 7 처리 포함)
+// ----------------------------------------------------------------------
+void parse_tlv_data(const uint8_t* packet_buffer, uint32_t total_length) {
 
-int main() {
-    printf("--- TLV Parsing Test Start ---\n");
+    const uint8_t* rx_buffer_ptr = packet_buffer + sizeof(MmwDemo_Header);
+    const MmwDemo_Header* header = (const MmwDemo_Header*)packet_buffer;
 
-    uint8_t* rx_buffer_ptr = rx_buffer;
-    size_t buffer_length = sizeof(rx_buffer);
-
-    // 1. 헤더 파싱 및 검증
-    MmwDemo_Header* header = (MmwDemo_Header*)rx_buffer_ptr;
-
-    // 🚨 Magic Word는 고정 값이므로, 변환된 값으로 비교해야 합니다.
-    // 레이더가 리틀 엔디안으로 보내는 것으로 가정했으므로, 여기서는 변환이 필요 없지만,
-    // 만약 레이더가 빅 엔디안을 쓴다면 header->magicWord != swap_endian32(0xDEADBEEF) 로 비교해야 합니다.
-    // 일단 현재 가상 데이터는 리틀 엔디안이므로, 변환 없이 비교합니다.
-    if (header->magicWord != 0xDEADBEEF) {
-        printf("Error: Invalid Magic Word (Expected 0xDEADBEEF, Got 0x%X)\n", header->magicWord);
-        return 1;
-    }
-
-    // 🚨 헤더 필드 변환 적용!
-    uint32_t totalLength = header->totalLength;
     uint16_t numTLV = header->numTLV;
-    // 만약 빅 엔디안이라면:
-    // uint32_t totalLength = swap_endian32(header->totalLength);
-    // uint16_t numTLV = swap_endian16(header->numTLV);
 
-    printf("Header OK. Total Length: %u bytes, Num TLV: %u\n", totalLength, numTLV);
+    // Total Length는 파싱 로직에서 이미 검증되었으므로 그대로 사용합니다.
+    printf("\n--- TLV Frame Start --- (Total Length: %u, Num TLV: %u)\n", total_length, numTLV);
 
-    // 2. TLV 목록 시작 위치로 포인터 이동
-    rx_buffer_ptr += sizeof(MmwDemo_Header);
-
-    // 3. TLV 목록 순회
-    // 순회 횟수를 변환된 numTLV로 제한합니다.
     for (int i = 0; i < numTLV; i++) {
-        TLV_Header* tlv_h = (TLV_Header*)rx_buffer_ptr;
+        const TLV_Header* tlv_h = (const TLV_Header*)rx_buffer_ptr;
 
-        // 🚨 TLV 헤더 필드 변환 적용!
+        // 현재 Little Endian 가정이므로 엔디안 변환 함수(swap_endian)를 사용하지 않습니다.
         uint32_t type = tlv_h->type;
         uint32_t length = tlv_h->length;
-        // 만약 빅 엔디안이라면:
-        // uint32_t type = swap_endian32(tlv_h->type);
-        // uint32_t length = swap_endian32(tlv_h->length);
 
-        printf("\n[TLV #%d] Type: %u, Length: %u bytes\n", i + 1, type, length);
+        printf("[TLV #%d] Type: %u, Length: %u bytes\n", i + 1, type, length);
 
-        // 데이터(Value) 영역의 시작 위치로 포인터 이동
-        uint8_t* tlv_value_ptr = rx_buffer_ptr + sizeof(TLV_Header);
+        const uint8_t* tlv_value_ptr = rx_buffer_ptr + sizeof(TLV_Header);
 
-        if (type == 1) { // Type 1: Point Cloud
+        if (type == 1) { // Type 1: Point Cloud (X, Y, Z, V)
             size_t num_points = length / sizeof(PointCloud_t);
-            PointCloud_t* points_array = (PointCloud_t*)tlv_value_ptr;
+            const PointCloud_t* points_array = (const PointCloud_t*)tlv_value_ptr;
 
-            for (size_t j = 0; j < num_points; j++) {
-                // 🚨 PointCloud 필드 변환 적용! (X, Y, Z, V 모두 2바이트)
-                int16_t x = points_array[j].x;
-                int16_t y = points_array[j].y;
-                int16_t z = points_array[j].z;
-                int16_t velocity = points_array[j].velocity;
-                // 만약 빅 엔디안이라면:
-                // int16_t x = (int16_t)swap_endian16(points_array[j].x);
-                // int16_t y = (int16_t)swap_endian16(points_array[j].y);
-                // int16_t z = (int16_t)swap_endian16(points_array[j].z);
-                // int16_t velocity = (int16_t)swap_endian16(points_array[j].velocity);
-
+            for (size_t j = 0; j < (num_points > 5 ? 5 : num_points); j++) {
                 printf("  -> Point %zu: X=%d, Y=%d, Z=%d, V=%d\n", j,
-                    x, y, z, velocity);
+                    points_array[j].x, points_array[j].y, points_array[j].z, points_array[j].velocity);
+            }
+            if (num_points > 5) printf("  ...and %zu more points (showing only 5)\n", num_points - 5);
+        }
+        else if (type == 7) { // Type 7: SNR Info (SNR, Noise)
+            size_t num_snr_items = length / sizeof(SNRInfo_t);
+            const SNRInfo_t* snr_array = (const SNRInfo_t*)tlv_value_ptr;
+
+            printf("  -> SNR Info received (Items: %zu)\n", num_snr_items);
+
+            for (size_t j = 0; j < (num_snr_items > 5 ? 5 : num_snr_items); j++) {
+                printf("    SNR Item %zu: SNR=%d, Noise=%d\n", j,
+                    snr_array[j].snr, snr_array[j].noise);
+            }
+            if (num_snr_items > 5) printf("    ...and %zu more SNR items (showing only 5)\n", num_snr_items - 5);
+        }
+
+        // 다음 TLV 블록으로 포인터 이동
+        rx_buffer_ptr += sizeof(TLV_Header) + length;
+
+        if (rx_buffer_ptr > packet_buffer + total_length) {
+            printf("Error: TLV structure exceeded total length.\n");
+            break;
+        }
+    }
+    printf("--- TLV Frame End ---\n");
+}
+
+
+// ----------------------------------------------------------------------
+// 5. UART 설정 및 수신 로직 (Windows API)
+// ----------------------------------------------------------------------
+HANDLE open_and_configure_serial_port(const char* port_name) {
+    // Port Opening (BaudRate: 115200)
+    HANDLE hSerial = CreateFileA(
+        port_name,
+        GENERIC_READ | GENERIC_WRITE,
+        0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL
+    );
+    if (hSerial == INVALID_HANDLE_VALUE) { printf("Error opening serial port %s\n", port_name); return INVALID_HANDLE_VALUE; }
+
+    DCB dcbSerialParams = { 0 };
+    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
+    if (!GetCommState(hSerial, &dcbSerialParams)) { CloseHandle(hSerial); return INVALID_HANDLE_VALUE; }
+
+    dcbSerialParams.BaudRate = 115200; // 확정된 Baud Rate
+    dcbSerialParams.ByteSize = 8;
+    dcbSerialParams.StopBits = ONESTOPBIT;
+    dcbSerialParams.Parity = NOPARITY;
+    if (!SetCommState(hSerial, &dcbSerialParams)) { CloseHandle(hSerial); return INVALID_HANDLE_VALUE; }
+
+    COMMTIMEOUTS timeouts = { 0 };
+    timeouts.ReadIntervalTimeout = 50;
+    timeouts.ReadTotalTimeoutConstant = 50;
+    timeouts.ReadTotalTimeoutMultiplier = 10;
+    SetCommTimeouts(hSerial, &timeouts);
+
+    return hSerial;
+}
+
+uint8_t rx_buffer[MAX_BUFFER_SIZE];
+size_t buffer_index = 0;
+
+int main() {
+    // ❗❗❗ 사용할 실제 COM 포트 번호로 변경하세요. (예: COM3, COM10 등)
+    const char* port_name = "\\\\.\\COM3";
+
+    HANDLE hSerial = open_and_configure_serial_port(port_name);
+
+    if (hSerial == INVALID_HANDLE_VALUE) {
+        printf("Failed to initialize serial communication.\n");
+        return 1;
+    }
+    printf("Serial port %s opened successfully at 115200 bps. Waiting for data...\n", port_name);
+
+    DWORD bytesRead;
+
+    while (1) {
+        // 1. UART로부터 새로운 데이터 읽기
+        ReadFile(hSerial, rx_buffer + buffer_index, MAX_BUFFER_SIZE - buffer_index, &bytesRead, NULL);
+        if (bytesRead > 0) {
+            buffer_index += bytesRead;
+        }
+
+        // 2. 버퍼에서 Magic Word를 찾아 프레임 동기화 시도
+        size_t search_offset = 0;
+
+        while (buffer_index >= HEADER_SIZE) {
+
+            // Magic Word 검색 (Little Endian 가정)
+            uint32_t current_magic = *(uint32_t*)(rx_buffer + search_offset);
+
+            if (current_magic == MAGIC_WORD) {
+                // Magic Word 발견!
+                MmwDemo_Header* header = (MmwDemo_Header*)(rx_buffer + search_offset);
+
+                // Total Length 읽기 (Little Endian 가정)
+                uint32_t total_length = header->totalLength;
+
+                // 3. 패킷 완성 여부 확인
+                if (buffer_index >= search_offset + total_length) {
+                    // **패킷이 완전히 도착함!**
+
+                    // TLV 파싱 함수 호출
+                    parse_tlv_data(rx_buffer + search_offset, total_length);
+
+                    // 파싱 완료된 데이터(패킷)를 버퍼에서 제거하고 나머지 데이터 앞으로 이동
+                    size_t packet_size = search_offset + total_length;
+                    size_t remaining_data = buffer_index - packet_size;
+                    memmove(rx_buffer, rx_buffer + packet_size, remaining_data);
+                    buffer_index = remaining_data;
+                    search_offset = 0; // 버퍼 시작부터 다시 동기화 시도
+                }
+                else {
+                    // 패킷이 아직 덜 도착함. 다음 ReadFile을 기다립니다.
+                    break;
+                }
+            }
+            else {
+                // Magic Word가 아님. 1바이트씩 이동하여 다음 Magic Word를 검색
+                search_offset++;
+
+                // 버퍼에 데이터가 남아있지 않으면 종료
+                if (search_offset > buffer_index - 4) {
+                    size_t remaining_data = buffer_index - search_offset;
+                    memmove(rx_buffer, rx_buffer + search_offset, remaining_data);
+                    buffer_index = remaining_data;
+                    search_offset = 0;
+                }
             }
         }
-        else if (type == 7) { // Type 7: SNR Info
-            printf("  -> SNR Info received (Actual parsing required based on SDK doc)\n");
-        }
 
-        // 다음 TLV 헤더 위치로 포인터 이동
-        rx_buffer_ptr += sizeof(TLV_Header) + length;
+        Sleep(10); // CPU 과부하 방지를 위해 10ms 대기
     }
 
-    printf("\n--- TLV Parsing Test Complete ---\n");
+    CloseHandle(hSerial);
     return 0;
 }
