@@ -1,200 +1,298 @@
+// mmw_uart_win.c  (Windows / Win32 API)
+// - Opens two COM ports: CFG(115200) and DATA(921600)
+// - Sends cfg file line-by-line (CRLF) to CFG
+// - Reads DATA, syncs on Magic Word, parses FrameHeader/TLV
+// - For TLV type==1 (Detected Points), prints and UDP-sends "F<frame>,x,y,z,v\n"
+//
+// Usage:
+//   mmw_uart_win.exe <CFG_COM> <DATA_COM> <cfg_file> [udp_ip] [udp_port]
+//   ex) mmw_uart_win.exe COM23 COM24 "C:\\...\\xwr68xx_AOP_profile.cfg"
+//   ex) mmw_uart_win.exe COM23 COM24 "C:\\...\\xwr68xx_AOP_profile.cfg" 127.0.0.1 9002
+//
+// NOTE: This expects the 44B OOB header (8B magic + 9*4B fields).
+
+#define _CRT_SECURE_NO_WARNINGS
+#define _WIN32_WINNT 0x0600
+
+#include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h> // Windows API for Serial Communication
 
-// --- 1. 설정 및 상수 ---
-#define MAGIC_WORD 0xDEADBEEF 
-#define HEADER_SIZE 40      
-#define MAX_BUFFER_SIZE 4096 
-#define MAX_PACKET_LENGTH 2048 // 🚨🚨🚨 TLV 패킷의 최대 길이 (4096을 넘지 않는 상식적인 값으로 설정)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "Ws2_32.lib")
 
-// ----------------------------------------------------------------------
-// 2. 구조체 정의 (바이트 정렬 필수)
-// ----------------------------------------------------------------------
-#pragma pack(1)
+static const uint8_t MAGIC8[8] = {0x02,0x01,0x04,0x03,0x06,0x05,0x08,0x07}; // LE bytes of 0102 0304 0506 0708
 
+#pragma pack(push,1)
 typedef struct {
-    uint32_t magicWord;
+    // 44B header: 8B magic + nine 4B fields
+    uint8_t  magic[8];
     uint32_t version;
-    uint32_t totalLength;
-    uint32_t frameNumber;
+    uint32_t totalPacketLen;
     uint32_t platform;
+    uint32_t frameNumber;
     uint32_t timeCpuCycles;
-    uint16_t numDetectedObj;
-    uint16_t numTLV;
-    uint32_t subFrameNum;
-} MmwDemo_Header;
-
-typedef struct {
-    int16_t x; int16_t y; int16_t z; int16_t velocity;
-} PointCloud_t;
-
-// Type 7: SNR/Noise 정보 (가정: 4 bytes)
-typedef struct {
-    int16_t snr;
-    int16_t noise;
-} SNRInfo_t;
+    uint32_t numDetectedObj;
+    uint32_t numTLVs;
+    uint32_t subFrameNumber;
+} FrameHeader44;
 
 typedef struct {
     uint32_t type;
-    uint32_t length;
-} TLV_Header;
+    uint32_t length; // payload length only
+} TLVHeader;
 
-#pragma pack() 
-// ----------------------------------------------------------------------
+typedef struct {
+    float x, y, z;
+    float doppler;
+} DetectedPoint;
+#pragma pack(pop)
 
-// 3. TLV 파싱 함수 (로직은 이전과 동일)
-void parse_tlv_data(const uint8_t* packet_buffer, uint32_t total_length) {
-    // Type 1과 Type 7 파싱 로직 그대로 사용
+// ------------------ Serial helpers ------------------
+static HANDLE open_com(const char* name, DWORD baud)
+{
+    char path[64];
+    // Win32: need "\\.\COMx" for COM>9
+    snprintf(path, sizeof(path), "\\\\.\\%s", name);
+    HANDLE h = CreateFileA(path, GENERIC_READ|GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h==INVALID_HANDLE_VALUE) return h;
 
-    const uint8_t* rx_buffer_ptr = packet_buffer + sizeof(MmwDemo_Header);
-    const MmwDemo_Header* header = (const MmwDemo_Header*)packet_buffer;
+    DCB dcb = {0};
+    dcb.DCBlength = sizeof(dcb);
+    if (!GetCommState(h, &dcb)) { CloseHandle(h); return INVALID_HANDLE_VALUE; }
+    dcb.BaudRate = baud;
+    dcb.ByteSize = 8;
+    dcb.Parity   = NOPARITY;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.fOutxCtsFlow = FALSE; dcb.fOutxDsrFlow = FALSE;
+    dcb.fDtrControl  = DTR_CONTROL_DISABLE;
+    dcb.fRtsControl  = RTS_CONTROL_DISABLE;
+    dcb.fOutX = dcb.fInX = FALSE;
+    if (!SetCommState(h, &dcb)) { CloseHandle(h); return INVALID_HANDLE_VALUE; }
 
-    uint16_t numTLV = header->numTLV;
+    COMMTIMEOUTS to = {0};
+    to.ReadIntervalTimeout         = 5;
+    to.ReadTotalTimeoutConstant    = 5;
+    to.ReadTotalTimeoutMultiplier  = 0;
+    to.WriteTotalTimeoutConstant   = 100;
+    to.WriteTotalTimeoutMultiplier = 0;
+    SetCommTimeouts(h, &to);
 
-    printf("\n--- TLV Frame Start --- (Total Length: %u, Num TLV: %u)\n", total_length, numTLV);
+    SetupComm(h, 1<<20, 1<<20);
+    PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
+    return h;
+}
 
-    for (int i = 0; i < numTLV; i++) {
-        const TLV_Header* tlv_h = (const TLV_Header*)rx_buffer_ptr;
+static bool write_line_crlf(HANDLE h, const char* line)
+{
+    DWORD wr=0;
+    size_t n = strlen(line);
+    // trim trailing \r?\n
+    while (n && (line[n-1]=='\n' || line[n-1]=='\r')) n--;
 
-        uint32_t type = tlv_h->type;
-        uint32_t length = tlv_h->length;
+    if (n) {
+        if (!WriteFile(h, line, (DWORD)n, &wr, NULL)) return false;
+        if (wr != n) return false;
+    }
+    const char crlf[2] = {'\r','\n'};
+    if (!WriteFile(h, crlf, 2, &wr, NULL)) return false;
+    return wr==2;
+}
 
-        printf("[TLV #%d] Type: %u, Length: %u bytes\n", i + 1, type, length);
+static bool send_cfg_file(HANDLE h_cfg, const char* cfg_path)
+{
+    FILE* fp = fopen(cfg_path, "rb");
+    if (!fp) { fprintf(stderr, "cfg open fail: %s\n", cfg_path); return false; }
+    char buf[2048];
+    while (fgets(buf, sizeof(buf), fp)) {
+        // skip obvious comments if present
+        const char* p = buf;
+        while (*p==' '||*p=='\t') p++;
+        if (*p=='%' || *p=='#' || (*p=='/' && *(p+1)=='/')) { continue; }
 
-        const uint8_t* tlv_value_ptr = rx_buffer_ptr + sizeof(TLV_Header);
+        if (!write_line_crlf(h_cfg, buf)) { fclose(fp); return false; }
+        // small delay; device may need a breath per line
+        Sleep(5);
+    }
+    fclose(fp);
+    return true;
+}
 
-        if (type == 1) {
-            size_t num_points = length / sizeof(PointCloud_t);
-            const PointCloud_t* points_array = (const PointCloud_t*)tlv_value_ptr;
+static bool read_exact(HANDLE h, void* out, DWORD n)
+{
+    uint8_t* p = (uint8_t*)out;
+    DWORD got=0, rd=0;
+    while (got < n) {
+        if (!ReadFile(h, p+got, n-got, &rd, NULL)) return false;
+        if (rd==0) Sleep(1);
+        got += rd;
+    }
+    return true;
+}
 
-            for (size_t j = 0; j < (num_points > 5 ? 5 : num_points); j++) {
-                printf("  -> Point %zu: X=%d, Y=%d, Z=%d, V=%d\n", j, points_array[j].x, points_array[j].y, points_array[j].z, points_array[j].velocity);
-            }
-            if (num_points > 5) printf("  ...and %zu more points (showing only 5)\n", num_points - 5);
-        }
-        else if (type == 7) {
-            size_t num_snr_items = length / sizeof(SNRInfo_t);
-            const SNRInfo_t* snr_array = (const SNRInfo_t*)tlv_value_ptr;
-
-            printf("  -> SNR Info received (Items: %zu)\n", num_snr_items);
-
-            for (size_t j = 0; j < (num_snr_items > 5 ? 5 : num_snr_items); j++) {
-                printf("    SNR Item %zu: SNR=%d, Noise=%d\n", j, snr_array[j].snr, snr_array[j].noise);
-            }
-            if (num_snr_items > 5) printf("    ...and %zu more SNR items (showing only 5)\n", num_snr_items - 5);
-        }
-
-        rx_buffer_ptr += sizeof(TLV_Header) + length;
-
-        if (rx_buffer_ptr > packet_buffer + total_length) {
-            printf("Error: TLV structure exceeded total length.\n");
-            break;
+static bool find_magic(HANDLE h)
+{
+    uint8_t w[8]={0};
+    DWORD rd=0;
+    size_t filled=0;
+    for (;;) {
+        if (!ReadFile(h, w+filled, 1, &rd, NULL)) return false;
+        if (rd==0) continue;
+        filled++;
+        if (filled>=8) {
+            if (memcmp(w, MAGIC8, 8)==0) return true;
+            memmove(w, w+1, 7); // shift
+            filled=7;
         }
     }
-    printf("--- TLV Frame End ---\n");
+    // unreachable
 }
 
-
-// 4. UART 설정 및 수신 로직 (Windows API)
-HANDLE open_and_configure_serial_port(const char* port_name) {
-    //  open_and_configure_serial_port 함수 내용 그대로 사용
-    HANDLE hSerial = CreateFileA(port_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hSerial == INVALID_HANDLE_VALUE) { printf("Error opening serial port %s\n", port_name); return INVALID_HANDLE_VALUE; }
-
-    DCB dcbSerialParams = { 0 }; dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
-    if (!GetCommState(hSerial, &dcbSerialParams)) { CloseHandle(hSerial); return INVALID_HANDLE_VALUE; }
-
-    dcbSerialParams.BaudRate = 115200; dcbSerialParams.ByteSize = 8;
-    dcbSerialParams.StopBits = ONESTOPBIT; dcbSerialParams.Parity = NOPARITY;
-    if (!SetCommState(hSerial, &dcbSerialParams)) { CloseHandle(hSerial); return INVALID_HANDLE_VALUE; }
-
-    COMMTIMEOUTS timeouts = { 0 };
-    timeouts.ReadIntervalTimeout = 50; timeouts.ReadTotalTimeoutConstant = 50; timeouts.ReadTotalTimeoutMultiplier = 10;
-    timeouts.WriteTotalTimeoutConstant = 50; timeouts.WriteTotalTimeoutMultiplier = 10;
-    SetCommTimeouts(hSerial, &timeouts);
-
-    return hSerial;
-}
-
-uint8_t rx_buffer[MAX_BUFFER_SIZE];
-size_t buffer_index = 0;
-
-int main() {
-    const char* port_name = "\\\\.\\COM3"; // ❗ 사용할 COM 포트 번호로 변경
-    HANDLE hSerial = open_and_configure_serial_port(port_name);
-
-    if (hSerial == INVALID_HANDLE_VALUE) {
-        printf("Failed to initialize serial communication.\n");
+// ------------------ main ------------------
+int main(int argc, char** argv)
+{
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <CFG_COM> <DATA_COM> <cfg_file> [udp_ip] [udp_port]\n", argv[0]);
+        fprintf(stderr, " ex) %s COM23 COM24 xwr68xx_AOP_profile.cfg\n", argv[0]);
+        fprintf(stderr, " ex) %s COM23 COM24 xwr68xx_AOP_profile.cfg 127.0.0.1 9002\n", argv[0]);
         return 1;
     }
-    printf("Serial port %s opened successfully at 115200 bps. Waiting for data...\n", port_name);
+    const char* cfg_com  = argv[1];
+    const char* data_com = argv[2];
+    const char* cfg_file = argv[3];
 
-    DWORD bytesRead;
+    // UDP defaults
+    const char* udp_ip   = (argc >= 5) ? argv[4] : "127.0.0.1";
+    int         udp_port = (argc >= 6) ? atoi(argv[5]) : 9001;
 
-    while (1) {
-        // 1. UART로부터 새로운 데이터 읽기
-        ReadFile(hSerial, rx_buffer + buffer_index, MAX_BUFFER_SIZE - buffer_index, &bytesRead, NULL);
-        if (bytesRead > 0) {
-            buffer_index += bytesRead;
-        }
-
-        // 2. 버퍼에서 Magic Word를 찾아 프레임 동기화 시도
-        size_t search_offset = 0;
-
-        while (buffer_index >= HEADER_SIZE) {
-
-            uint32_t current_magic = *(uint32_t*)(rx_buffer + search_offset);
-
-            if (current_magic == MAGIC_WORD) {
-
-                MmwDemo_Header* header = (MmwDemo_Header*)(rx_buffer + search_offset);
-                uint32_t total_length = header->totalLength;
-
-                // 🚨🚨🚨 3. Total Length 안전성 검증 (강화된 로직) 🚨🚨🚨
-                if (total_length > MAX_PACKET_LENGTH || total_length < HEADER_SIZE) {
-                    printf("Desync: Invalid Total Length (%u). Skipping header.\n", total_length);
-                    search_offset += 4; // Magic Word 건너뛰고 다음 4바이트부터 다시 검색
-                    continue;
-                }
-
-                // 4. 패킷 완성 여부 확인
-                if (buffer_index >= search_offset + total_length) {
-
-                    parse_tlv_data(rx_buffer + search_offset, total_length);
-
-                    // 파싱 완료된 패킷을 버퍼에서 제거
-                    size_t packet_size = search_offset + total_length;
-                    size_t remaining_data = buffer_index - packet_size;
-                    memmove(rx_buffer, rx_buffer + packet_size, remaining_data);
-                    buffer_index = remaining_data;
-                    search_offset = 0;
-                }
-                else {
-                    // 패킷이 덜 도착함.
-                    break;
-                }
-            }
-            else {
-                // Magic Word가 아님. 1바이트씩 이동하며 검색
-                search_offset++;
-
-                // 오염된 데이터 정리
-                if (search_offset > buffer_index - 4) {
-                    size_t remaining_data = buffer_index - search_offset;
-                    memmove(rx_buffer, rx_buffer + search_offset, remaining_data);
-                    buffer_index = remaining_data;
-                    search_offset = 0;
-                }
-            }
-        }
-
-        // ❗❗❗ [FPGA 포팅 시 수정 필요] Sleep 함수를 타겟 시스템의 지연 함수로 교체필요. 
-        Sleep(10);
+    // Open serials
+    HANDLE h_cfg  = open_com(cfg_com, 115200);
+    if (h_cfg==INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        fprintf(stderr, "open %s fail (err=%lu)\n", cfg_com, (unsigned long)e);
+        return 2;
+    }
+    HANDLE h_data = open_com(data_com, 921600);
+    if (h_data==INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        fprintf(stderr, "open %s fail (err=%lu)\n", data_com, (unsigned long)e);
+        CloseHandle(h_cfg);
+        return 3;
     }
 
-    CloseHandle(hSerial);
+    // Init UDP
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        CloseHandle(h_cfg); CloseHandle(h_data);
+        return 4;
+    }
+    SOCKET usock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (usock == INVALID_SOCKET) {
+        fprintf(stderr, "socket() failed\n");
+        CloseHandle(h_cfg); CloseHandle(h_data);
+        WSACleanup();
+        return 5;
+    }
+    struct sockaddr_in dst; memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_port   = htons((u_short)udp_port);
+    unsigned long ia = inet_addr(udp_ip);  // IPv4 only
+    if (ia == INADDR_NONE) {
+        fprintf(stderr, "invalid IPv4: %s\n", udp_ip);
+        closesocket(usock); CloseHandle(h_cfg); CloseHandle(h_data); WSACleanup();
+        return 6;
+    }
+dst.sin_addr.s_addr = ia;
+
+
+    printf("[CFG] sending cfg: %s\n", cfg_file);
+    if (!send_cfg_file(h_cfg, cfg_file)) {
+        fprintf(stderr, "cfg send failed\n");
+        closesocket(usock); WSACleanup();
+        CloseHandle(h_cfg); CloseHandle(h_data);
+        return 7;
+    }
+    printf("[CFG] done. listening DATA…  (UDP -> %s:%d)\n", udp_ip, udp_port);
+
+    // Main loop
+    for (;;) {
+        // 1) magic sync
+        if (!find_magic(h_data)) { fprintf(stderr, "sync fail\n"); break; }
+
+        // 2) read rest of header (we already consumed magic)
+        FrameHeader44 fh;
+        memcpy(fh.magic, MAGIC8, 8);
+        if (!read_exact(h_data, ((uint8_t*)&fh)+8, sizeof(fh)-8)) break;
+
+        // 3) TLVs
+        uint32_t bytes_left = 0;
+        if (fh.totalPacketLen < sizeof(fh)) {
+            // corrupted packet; resync
+            continue;
+        }
+        bytes_left = fh.totalPacketLen - sizeof(fh);
+
+        for (uint32_t i=0; i<fh.numTLVs && bytes_left >= sizeof(TLVHeader); i++) {
+            TLVHeader th;
+            if (!read_exact(h_data, &th, sizeof(th))) goto CLEANUP;
+            if (bytes_left < sizeof(th)) goto CLEANUP;
+            bytes_left -= sizeof(th);
+
+            if (th.type == 1) {
+                uint32_t n = th.length / sizeof(DetectedPoint);
+                for (uint32_t k=0; k<n; k++) {
+                    DetectedPoint p;
+                    if (!read_exact(h_data, &p, sizeof(p))) goto CLEANUP;
+                    printf("F%u N%u: x=%.3f y=%.3f z=%.3f v=%.3f\n",
+                           fh.frameNumber, k, p.x, p.y, p.z, p.doppler);
+
+                    // ---- UDP send line ----
+                    char line[256];
+                    int len = snprintf(line, sizeof(line),
+                        "F%u,%.3f,%.3f,%.3f,%.3f\n",
+                        fh.frameNumber, p.x, p.y, p.z, p.doppler);
+                    if (len > 0) {
+                        sendto(usock, line, len, 0,
+                               (struct sockaddr*)&dst, sizeof(dst));
+                    }
+                }
+                if (bytes_left < th.length) goto CLEANUP;
+                bytes_left -= th.length;
+            } else {
+                // skip other TLVs
+                const uint32_t CHUNK = 1024;
+                uint8_t dump[CHUNK];
+                uint32_t left = th.length;
+                while (left) {
+                    uint32_t c = left > CHUNK ? CHUNK : left;
+                    if (!read_exact(h_data, dump, c)) goto CLEANUP;
+                    left -= c;
+                }
+                if (bytes_left < th.length) goto CLEANUP;
+                bytes_left -= th.length;
+            }
+        }
+
+        // 4) if extra padding remains (32B align etc.), skip it
+        if (bytes_left) {
+            uint8_t pad[64];
+            while (bytes_left) {
+                uint32_t c = bytes_left > sizeof(pad) ? sizeof(pad) : bytes_left;
+                if (!read_exact(h_data, pad, c)) goto CLEANUP;
+                bytes_left -= c;
+            }
+        }
+    }
+
+CLEANUP:
+    closesocket(usock);
+    WSACleanup();
+    CloseHandle(h_cfg);
+    CloseHandle(h_data);
     return 0;
 }
